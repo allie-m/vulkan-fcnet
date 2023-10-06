@@ -1,0 +1,19 @@
+#version 460
+
+layout(set = 0, binding = 0) buffer Scores {
+	float scores[];
+};
+
+layout (local_size_x = 64, local_size_y = 10) in;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+    float sum = scores[gid.x * 10] + scores[gid.x * 10 + 1] + scores[gid.x * 10 + 2] + scores[gid.x * 10 + 3] + scores[gid.x * 10 + 4]
+                + scores[gid.x * 10 + 5] + scores[gid.x * 10 + 6] + scores[gid.x * 10 + 7] + scores[gid.x * 10 + 8] + scores[gid.x * 10 + 9];
+    
+    memoryBarrierBuffer();
+	barrier();
+
+    scores[gid.x * 10 + gid.y] /= sum;
+}

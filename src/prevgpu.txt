@@ -1,0 +1,518 @@
+use std::borrow::Cow;
+use std::mem::size_of;
+
+use ndarray::prelude::*;
+use ndarray_rand::rand::prelude::*;
+use ndarray_rand::{rand_distr::Uniform, RandomExt};
+use wgpu::{
+    util::{BufferInitDescriptor, DeviceExt},
+    Backends, Buffer, BufferDescriptor, BufferUsages, CommandBuffer, CommandEncoderDescriptor,
+    Device, DeviceDescriptor, Dx12Compiler, Features, Instance, InstanceDescriptor, Limits,
+    Maintain, MapMode, PowerPreference, Queue, RequestAdapterOptions,
+};
+use wgpu::{
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingType, BufferBindingType, ComputePassDescriptor, ComputePipeline,
+    ComputePipelineDescriptor, PipelineLayoutDescriptor, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages,
+};
+
+pub fn train(
+    x: Array2<f32>,
+    y: Array1<u32>,
+    num_iterations: u32,
+    reg: f32,
+    step_size: f32,
+    batch_size: usize,
+) -> (Array2<f32>, Array2<f32>) {
+    let init_weights = Array::random((28 * 28, 10), Uniform::new(0.0, 0.01));
+
+    let (device, queue) = device_queue();
+    let GPUState {
+        xbatch_cpu,
+        ybatch_cpu,
+        xbatch_gpu_1,
+        xbatch_gpu_2,
+        ybatch_gpu_1,
+        ybatch_gpu_2,
+        weights,
+        biases,
+        scores,
+        batch_1_bg,
+        batch_2_bg,
+        weights_bg,
+        scores_bg,
+        calculate_scores_pipeline,
+    } = gpu_state(&device, batch_size, init_weights.clone());
+
+    let mut next_xbatch_gpu = &xbatch_gpu_1;
+    let mut next_ybatch_gpu = &ybatch_gpu_1;
+    let mut next_batch_bg = &batch_1_bg;
+    let mut batch = true; // true for batch 1, false for batch 2
+
+    let mut r = Array::range(0.0, x.shape()[0] as f32, 1.0);
+    let mut x_batch = Array::<f32, _>::zeros((batch_size, 28 * 28));
+    let mut y_batch = Array::<u32, _>::zeros((batch_size,));
+
+    let mut rng = ndarray_rand::rand::thread_rng();
+
+    let mut in_flight_op = None;
+    for _ in 1..=num_iterations {
+        // prepare the batches
+        r.as_slice_mut().unwrap().shuffle(&mut rng);
+        for i in 0..batch_size {
+            let index = r[i] as usize;
+            x_batch.slice_mut(s![i, ..]).assign(&x.row(index));
+            y_batch[i] = y[index];
+        }
+        let transfer_batch = cmd_transfer_batch(
+            &device,
+            &x_batch,
+            &y_batch,
+            batch_size,
+            &xbatch_cpu,
+            &ybatch_cpu,
+            next_xbatch_gpu,
+            next_ybatch_gpu,
+        );
+        // wait for the new batch to transfer before trying to submit commands using it
+        device.poll(Maintain::WaitForSubmissionIndex(
+            queue.submit(Some(transfer_batch)),
+        ));
+        // make sure that the in-flight op is done
+        if let Some(id) = in_flight_op {
+            device.poll(Maintain::WaitForSubmissionIndex(id));
+        }
+
+        // wait for the below buffer (saved to a submission index) to finish, using the newly transferred batch
+        // submit the following as one command buffer:
+        // - scores pass
+        // - loss pass (depends on score)
+        // - gradient pass (depends on score)
+        // - backprop pass (depends on gradient)
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("main compute encoder"),
+        });
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("compute pass"),
+            });
+            cpass.set_bind_group(0, &next_batch_bg, &[]);
+            cpass.set_bind_group(1, &weights_bg, &[]);
+            cpass.set_bind_group(2, &scores_bg, &[]);
+            cpass.set_pipeline(&calculate_scores_pipeline);
+            cpass.dispatch_workgroups(batch_size as u32, 10, 1);
+        }
+        in_flight_op = Some(queue.submit(Some(encoder.finish())));
+
+        // after everything has been submitted switch to the other buffers for writing the new random batch
+        {
+            if batch {
+                next_xbatch_gpu = &xbatch_gpu_2;
+                next_ybatch_gpu = &ybatch_gpu_2;
+                next_batch_bg = &batch_2_bg;
+            } else {
+                next_xbatch_gpu = &xbatch_gpu_1;
+                next_ybatch_gpu = &ybatch_gpu_1;
+                next_batch_bg = &batch_1_bg;
+            }
+            batch = !batch;
+        }
+    }
+    let ts = x_batch.dot(&init_weights);
+    println!("{}, {:?}", ts.iter().map(|f| (((unsafe { std::mem::transmute::<_, u32>(*f) } >> 23) & 0xff) as i32 - 127 + 23) as i64)
+        .max()
+        .unwrap(), ts.iter().map(|f| (((unsafe { std::mem::transmute::<_, u32>(*f) } >> 23) & 0xff) as i32 - 127 + 23) as i64).min().unwrap());
+    let f = ts[(0, 0)];
+    let f = x_batch.iter().find(|a| **a != 0.0).unwrap() * init_weights[(0, 0)];
+    ts.map(|f| assert!(f.is_normal()));
+    let bits: u32 = unsafe { std::mem::transmute(f) };
+    let sign: u32 = bits >> 31;
+    let mut exponent: i32 = ((bits >> 23) & 0xff) as i32;
+    let mantissa = if exponent == 0 {
+        (bits & 0x7fffff) << 1
+    } else {
+        (bits & 0x7fffff) | 0x800000
+    };
+    exponent -= 127 + 23;
+    println!("{:?}, 2**{:?} * {:?}", f, exponent, mantissa);
+    if -exponent > 25 {
+        println!("here: {:b}", mantissa >> (-25 - exponent));
+    } else {
+        println!("aahere: {:b}", (mantissa << (25 + exponent)) | (sign << 31));
+    }
+    // println!("{}, {}", mantissa >> 4, -25 - exponent);
+    // println!("{:b}, {:b}", mantissa, mantissa << (25 + exponent));
+    // println!("{:?}", ts);
+    // let mut ts = Array2::<f32>::zeros((256, 10));
+    // for x in 0..256 {
+    //     for y in 0..10 {
+    //         for z in 0..28 * 28 {
+    //             let v = x_batch[(x, z)] * init_weights[(z, y)];
+    //             let va = x_batch.as_slice().unwrap()[x * 28 * 28 + z]
+    //                 * init_weights.as_slice().unwrap()[z * 10 + y];
+    //             assert_eq!(v, va);
+    //             ts[(x, y)] += v;
+    //         }
+    //     }
+    // }
+    // println!("{:?}", &ts);
+    {
+        let test = device.create_buffer(&BufferDescriptor {
+            label: Some("test"),
+            size: 256 * 10 * 4,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("test encoder"),
+        });
+        encoder.copy_buffer_to_buffer(&scores, 0, &test, 0, 256 * 10 * 4);
+        queue.submit(Some(encoder.finish()));
+        test.slice(..).map_async(MapMode::Read, |r| r.unwrap());
+        device.poll(Maintain::Wait);
+        let view = test.slice(..).get_mapped_range();
+        let t = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const u32, 256 * 10) };
+        println!("{:b}", t[0]);
+        println!("{:?}", &t[..100]);
+        drop(view);
+        test.unmap();
+    }
+
+    (Array2::zeros((1, 1)), Array2::zeros((1, 1)))
+}
+
+struct GPUState {
+    xbatch_cpu: Buffer,
+    ybatch_cpu: Buffer,
+    xbatch_gpu_1: Buffer,
+    xbatch_gpu_2: Buffer,
+    ybatch_gpu_1: Buffer,
+    ybatch_gpu_2: Buffer,
+    weights: Buffer,
+    biases: Buffer,
+    scores: Buffer,
+    //
+    batch_1_bg: BindGroup,
+    batch_2_bg: BindGroup,
+    weights_bg: BindGroup,
+    scores_bg: BindGroup,
+    //
+    calculate_scores_pipeline: ComputePipeline,
+}
+
+// assumes that the cpu buffers are ready to be mapped
+// returns a command buffer when finished
+fn cmd_transfer_batch(
+    device: &Device,
+    x_batch: &Array2<f32>,
+    y_batch: &Array1<u32>,
+    batch_size: usize,
+    xbatch_cpu: &Buffer,
+    ybatch_cpu: &Buffer,
+    xbatch_gpu: &Buffer,
+    ybatch_gpu: &Buffer,
+) -> CommandBuffer {
+    xbatch_cpu
+        .slice(..)
+        .map_async(MapMode::Write, |r| r.unwrap());
+    ybatch_cpu
+        .slice(..)
+        .map_async(MapMode::Write, |r| r.unwrap());
+    device.poll(Maintain::Poll);
+    let mut x_mapped = xbatch_cpu.slice(..).get_mapped_range_mut();
+    let mut y_mapped = ybatch_cpu.slice(..).get_mapped_range_mut();
+    unsafe {
+        std::ptr::copy(
+            x_batch.as_slice().unwrap().as_ptr() as *const u8,
+            x_mapped.as_mut_ptr(),
+            batch_size * 28 * 28 * size_of::<f32>(),
+        );
+        std::ptr::copy(
+            y_batch.as_slice().unwrap().as_ptr() as *const u8,
+            y_mapped.as_mut_ptr(),
+            batch_size * 10 * size_of::<u32>(),
+        );
+    };
+    drop(x_mapped);
+    drop(y_mapped);
+    xbatch_cpu.unmap();
+    ybatch_cpu.unmap();
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("batch copy encoder"),
+    });
+    encoder.copy_buffer_to_buffer(
+        xbatch_cpu,
+        0,
+        xbatch_gpu,
+        0,
+        (batch_size * size_of::<f32>()) as u64 * 28 * 28,
+    );
+    encoder.copy_buffer_to_buffer(
+        ybatch_cpu,
+        0,
+        ybatch_gpu,
+        0,
+        (batch_size * size_of::<u32>()) as u64 * 10,
+    );
+    encoder.finish()
+}
+
+fn gpu_state(device: &Device, batch_size: usize, init_weights: Array2<f32>) -> GPUState {
+    // buffers
+
+    let xbatch_gpu_1 = device.create_buffer(&BufferDescriptor {
+        label: Some("xbatch gpu 1"),
+        size: (batch_size * size_of::<f32>()) as u64 * 28 * 28,
+        usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let xbatch_gpu_2 = device.create_buffer(&BufferDescriptor {
+        label: Some("xbatch gpu 2"),
+        size: (batch_size * size_of::<f32>()) as u64 * 28 * 28,
+        usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    // ok so shaders don't have u8 types
+    // meaning the y stuff will have to be converted to u32s
+    // annoyingly, space-inefficiently
+    let ybatch_gpu_1 = device.create_buffer(&BufferDescriptor {
+        label: Some("ybatch gpu 1"),
+        size: (batch_size * size_of::<u32>()) as u64 * 10,
+        usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let ybatch_gpu_2 = device.create_buffer(&BufferDescriptor {
+        label: Some("ybatch gpu 2"),
+        size: (batch_size * size_of::<u32>()) as u64 * 10,
+        usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let xbatch_cpu = device.create_buffer(&BufferDescriptor {
+        label: Some("xbatch cpu"),
+        size: (batch_size * size_of::<f32>()) as u64 * 28 * 28,
+        usage: BufferUsages::COPY_SRC | BufferUsages::MAP_WRITE,
+        mapped_at_creation: false,
+    });
+    let ybatch_cpu = device.create_buffer(&BufferDescriptor {
+        label: Some("ybatch cpu"),
+        size: (batch_size * size_of::<u32>()) as u64 * 10,
+        usage: BufferUsages::COPY_SRC | BufferUsages::MAP_WRITE,
+        mapped_at_creation: false,
+    });
+    assert_eq!(init_weights.shape(), &[28 * 28, 10]);
+    let weights = device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("weights"),
+        contents: unsafe {
+            std::slice::from_raw_parts(
+                init_weights.as_ptr() as *const u8,
+                28 * 28 * 10 * size_of::<f32>(),
+            )
+        },
+        usage: BufferUsages::STORAGE,
+    });
+    let biases = device.create_buffer(&BufferDescriptor {
+        label: Some("biases"),
+        size: 10 * size_of::<f32>() as u64,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let scores = device.create_buffer(&BufferDescriptor {
+        label: Some("scores"),
+        size: (batch_size * size_of::<f32>()) as u64 * 10,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    // bind group layouts
+
+    let batch_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("batch bind group"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let weights_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("batch bind group"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let scores_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("batch bind group"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    // bind groups
+    let batch_1_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("batch bind group"),
+        layout: &batch_bg_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: xbatch_gpu_1.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: ybatch_gpu_1.as_entire_binding(),
+            },
+        ],
+    });
+    let batch_2_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("batch bind group"),
+        layout: &batch_bg_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: xbatch_gpu_2.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: ybatch_gpu_2.as_entire_binding(),
+            },
+        ],
+    });
+    let weights_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("weights bind group"),
+        layout: &weights_bg_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: weights.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: biases.as_entire_binding(),
+            },
+        ],
+    });
+    let scores_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("scores bind group"),
+        layout: &scores_bg_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: scores.as_entire_binding(),
+        }],
+    });
+
+    // compute pipelines
+    let shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("shader"),
+        source: ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
+    });
+    let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("calculate scores pipeline layout"),
+        bind_group_layouts: &[&batch_bg_layout, &weights_bg_layout, &scores_bg_layout],
+        push_constant_ranges: &[],
+    });
+    let calculate_scores_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("calculate scores"),
+        layout: Some(&layout),
+        module: &shader,
+        entry_point: "calculate_scores",
+    });
+
+    GPUState {
+        xbatch_cpu,
+        ybatch_cpu,
+        xbatch_gpu_1,
+        xbatch_gpu_2,
+        ybatch_gpu_1,
+        ybatch_gpu_2,
+        weights,
+        biases,
+        scores,
+        //
+        batch_1_bg,
+        batch_2_bg,
+        weights_bg,
+        scores_bg,
+        //
+        calculate_scores_pipeline,
+    }
+}
+
+fn device_queue() -> (Device, Queue) {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::VULKAN,
+        dx12_shader_compiler: Dx12Compiler::Fxc,
+    });
+    let adapter = futures::executor::block_on(async {
+        instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+    })
+    .unwrap();
+    let (device, queue) = futures::executor::block_on(async {
+        adapter
+            .request_device(
+                &DeviceDescriptor {
+                    label: None,
+                    features: Features::TIMESTAMP_QUERY
+                        | Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                        | Features::PIPELINE_STATISTICS_QUERY
+                        | Features::PUSH_CONSTANTS,
+                    // | Features::SPIRV_SHADER_PASSTHROUGH,
+                    limits: Limits {
+                        max_push_constant_size: 128,
+                        ..Default::default()
+                    },
+                },
+                None,
+            )
+            .await
+    })
+    .unwrap();
+    (device, queue)
+}

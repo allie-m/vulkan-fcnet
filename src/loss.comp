@@ -1,0 +1,45 @@
+#version 460
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(set = 0, binding = 0) readonly buffer XBatch {
+	float xbatch[];
+};
+
+layout(set = 0, binding = 1) readonly buffer YBatch {
+	uint ybatch[];
+};
+
+layout(set = 1, binding = 0) buffer Scores {
+	float scores[];
+};
+
+layout(set = 2, binding = 0) buffer OutLoss {
+	float loss[];
+};
+
+shared float accumulated_loss;
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+    accumulated_loss = 0.0;
+    memoryBarrierShared();
+	barrier();
+    
+    float s = scores[gid.x * 10 + ybatch[gid.x]];
+    s = -log(s) / 256.0; // 256 is batch size
+    atomicAdd(accumulated_loss, s);
+
+    memoryBarrierShared();
+	barrier();
+
+    if (gid.x != 0) {
+        return;
+    }
+
+    loss[0] += 1;
+    loss[uint(loss[0])] = accumulated_loss;
+}

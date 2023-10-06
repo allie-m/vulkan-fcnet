@@ -1,0 +1,63 @@
+#version 460
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(set = 0, binding = 0) readonly buffer XBatch {
+	float xbatch[];
+};
+
+layout(set = 0, binding = 1) readonly buffer YBatch {
+	uint ybatch[];
+};
+
+layout(set = 1, binding = 0) buffer Weights {
+	float w[];
+};
+
+layout(set = 1, binding = 1) buffer Biases {
+	float b[];
+};
+
+layout(set = 2, binding = 0) buffer Scores {
+	float scores[];
+};
+
+layout(push_constant) uniform PushConstants {
+    float step_size;
+    float reg;
+};
+
+shared float local_dw;
+shared float accumulated_column;
+
+// that 256 is the batch size
+// to be invoked with dimensions: (1, 28*28, 10)
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+	local_dw = 0.0;
+    accumulated_column = 0.0;
+    memoryBarrierShared();
+	barrier();
+
+    float val = xbatch[gid.x * 784 + gid.y] * scores[gid.x * 10 + gid.z];
+    atomicAdd(local_dw, val);
+
+    atomicAdd(accumulated_column, scores[gid.x * 10 + gid.z]);
+
+    memoryBarrierShared();
+	barrier();
+
+    if (gid.x != 0) {
+        return;
+    }
+
+    float dw = w[gid.y * 10 + gid.z] * reg + local_dw;
+    w[gid.y * 10 + gid.z] -= dw * step_size;
+
+    if (gid.y == 0) {
+        b[gid.z] -= accumulated_column * step_size;
+    }
+}
