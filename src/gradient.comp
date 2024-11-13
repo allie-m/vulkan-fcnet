@@ -1,0 +1,30 @@
+#version 460
+
+layout(set = 0, binding = 0) readonly buffer XBatch {
+	float xbatch[];
+};
+
+layout(set = 0, binding = 1) readonly buffer YBatch {
+	uint ybatch[];
+};
+
+layout(set = 1, binding = 0) buffer Scores {
+	float scores[];
+};
+
+layout (local_size_x = 256) in;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    scores[gid.x * 10 + ybatch[gid.x]] -= 1.0;
+    scores[gid.x * 10 + 0] /= 256.0; // batch size is 256
+    scores[gid.x * 10 + 1] /= 256.0;
+    scores[gid.x * 10 + 2] /= 256.0;
+    scores[gid.x * 10 + 3] /= 256.0;
+    scores[gid.x * 10 + 4] /= 256.0;
+    scores[gid.x * 10 + 5] /= 256.0;
+    scores[gid.x * 10 + 6] /= 256.0;
+    scores[gid.x * 10 + 7] /= 256.0;
+    scores[gid.x * 10 + 8] /= 256.0;
+    scores[gid.x * 10 + 9] /= 256.0;
+}

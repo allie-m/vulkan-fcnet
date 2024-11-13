@@ -1,0 +1,44 @@
+#version 460
+
+#extension GL_EXT_shader_atomic_float : require
+
+layout(set = 0, binding = 0) readonly buffer XBatch {
+	float xbatch[];
+};
+
+layout(set = 0, binding = 1) readonly buffer YBatch {
+	uint ybatch[];
+};
+
+layout(set = 1, binding = 0) buffer Weights {
+	float w[];
+};
+
+layout(set = 1, binding = 1) buffer Biases {
+	float b[];
+};
+
+layout(set = 2, binding = 0) buffer Scores {
+	float scores[];
+};
+
+shared float local_score;
+
+// to be invoked with dimensions: (1, batch_size, 10)
+layout (local_size_x = 784, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+
+	local_score = 0.0;
+	memoryBarrierShared();
+	barrier();
+
+    float val = xbatch[gid.y * 28 * 28 + gid.x] * w[gid.x * 10 + gid.z] + b[gid.z];
+    atomicAdd(local_score, val);
+
+	memoryBarrierShared();
+	barrier();
+
+	scores[gid.y * 10 + gid.z] = exp(local_score);
+}
